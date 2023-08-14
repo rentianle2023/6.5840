@@ -21,8 +21,6 @@ import (
 	"6.5840/labgob"
 	"bytes"
 	"encoding/gob"
-	"fmt"
-
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -106,6 +104,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -173,10 +174,8 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	fmt.Println("persist")
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	fmt.Println(rf, rf.currentTerm, rf.votedFor, rf.log)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
@@ -191,7 +190,6 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	//Your code here (2C).
 	//Example:
-	fmt.Println("read Persist")
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm int
@@ -200,7 +198,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&log) != nil {
-		fmt.Println("decode error")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
@@ -241,15 +238,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
+	reply.VoteGranted = false
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
-		rf.votedFor = nil
+		rf.votedFor = -1
 		rf.state = Follower
 	}
+	//fmt.Println("current term", rf.currentTerm, "request term", args.Term)
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-	} else if (rf.votedFor == nil || rf.votedFor == args.CandidateId) && args.LastLogTerm >= rf.log[rf.commitIndex].Term && args.LastLogIndex >= rf.commitIndex {
+	} else if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && (args.LastLogTerm > rf.log[len(rf.log)-1].Term || (args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1)) {
+		//fmt.Println(rf.me, "vote for", args.CandidateId, "at term", args.Term)
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.lastHeartBeatTime = time.Now()
@@ -312,12 +311,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := rf.state == Leader
 
 	if isLeader {
+		//fmt.Println(rf.me, command, "at index", len(rf.log))
 		rf.log = append(rf.log, LogEntry{
 			Term:    term,
 			Command: command,
 		})
-		//fmt.Println("leader log", rf.me, rf.log)
 	}
+	rf.persist()
 	return index, term, isLeader
 }
 
@@ -344,10 +344,12 @@ func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here (2A)
 		// Check if a leader election should be started.
-		if rf.state != Leader && time.Now().Sub(rf.lastHeartBeatTime) > time.Second/2 {
+		if rf.state == Candidate || (rf.state == Follower && time.Now().Sub(rf.lastHeartBeatTime) > time.Second) {
+			rf.lastHeartBeatTime = time.Now()
 			rf.state = Candidate
 			rf.votedFor = rf.me
 			rf.currentTerm++
+			//fmt.Println(rf.me, "start ask to vote for term", rf.currentTerm)
 			newTerm := rf.currentTerm
 			rf.votes = make(chan RequestVoteReply)
 			voteNeeded := len(rf.peers)/2 + 1
@@ -361,8 +363,8 @@ func (rf *Raft) ticker() {
 				args := &RequestVoteArgs{
 					Term:         newTerm,
 					CandidateId:  rf.me,
-					LastLogIndex: rf.commitIndex,
-					LastLogTerm:  rf.log[rf.commitIndex].Term,
+					LastLogIndex: len(rf.log) - 1,
+					LastLogTerm:  rf.log[len(rf.log)-1].Term,
 				}
 				reply := &RequestVoteReply{}
 				go rf.sendRequestVote(i, args, reply, votes)
@@ -395,14 +397,13 @@ func (rf *Raft) ticker() {
 							endElection = true
 						}
 						if endElection {
-							rf.votedFor = nil
 							break outer
 						}
 					}
 				}
 			}
+			//fmt.Println(rf.me, "state", rf.state)
 		}
-
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		ms := 50 + (rand.Int63() % 300)
@@ -411,7 +412,7 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) convertToLeader() {
-	//fmt.Println(rf.me, "convert to Leader")
+	//fmt.Println(rf.me, "become leader")
 	rf.state = Leader
 	var nextIndex []int
 	var matchIndex []int
@@ -422,7 +423,7 @@ func (rf *Raft) convertToLeader() {
 	rf.nextIndex = nextIndex
 	rf.matchIndex = matchIndex
 	go rf.startSendingAgreement()
-	go rf.checkCommitIndex()
+	//go rf.checkCommitIndex()
 }
 
 func (rf *Raft) startSendingAgreement() {
@@ -438,7 +439,6 @@ func (rf *Raft) startSendingAgreement() {
 			if rf.state != Leader {
 				break
 			}
-			//fmt.Println(rf.me, i, len(rf.log)-1, rf.nextIndex[i])
 			if len(rf.log)-1 >= rf.nextIndex[i] {
 				go rf.sendAgreement(i, rf.nextIndex[i], currentTerm)
 			} else {
@@ -454,8 +454,40 @@ func (rf *Raft) startSendingAgreement() {
 				go rf.sendAppendEntries(i, args, reply)
 			}
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func findFirstIndexOfTerm(logs []LogEntry, term int) int {
+	l, r := 0, len(logs)-1
+	for l < r {
+		mid := (l + r) >> 1
+		if logs[mid].Term >= term {
+			r = mid
+		} else {
+			l = mid + 1
+		}
+	}
+	if logs[l].Term == term {
+		return l
+	}
+	return -1
+}
+
+func findLastIndexOfTerm(logs []LogEntry, term int) int {
+	l, r := 0, len(logs)-1
+	for l < r {
+		mid := (l + r + 1) >> 1
+		if logs[mid].Term <= term {
+			l = mid
+		} else {
+			r = mid - 1
+		}
+	}
+	if logs[l].Term == term {
+		return l
+	}
+	return -1
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -467,32 +499,56 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
-	} else {
+	} else if (rf.state == Candidate && args.Term == rf.currentTerm) || args.Term > rf.currentTerm {
 		rf.state = Follower
 		rf.currentTerm = args.Term
-		rf.votedFor = nil
-		rf.lastHeartBeatTime = time.Now()
+		rf.votedFor = -1
 	}
+	rf.lastHeartBeatTime = time.Now()
+	reply.Term = rf.currentTerm
 
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	// need more log
+	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
+		reply.XLen = len(rf.log)
+		return
+	}
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		reply.XIndex = findFirstIndexOfTerm(rf.log, reply.XTerm)
+		reply.XLen = len(rf.log)
 		return
 	}
 
+	// append new logs
 	reply.Success = true
 	if args.Entries != nil {
-		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-	}
-	if args.LeaderCommit > rf.commitIndex {
-		nextIndex := min(args.LeaderCommit, len(rf.log)-1)
-		for i := rf.commitIndex; i <= nextIndex; i++ {
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log[i].Command,
-				CommandIndex: i,
+		//if len(rf.log) >= args.PrevLogIndex + len(args.Entries)
+		for i := 0; i < len(args.Entries); i++ {
+			idx := args.PrevLogIndex + i + 1
+			if len(rf.log) > idx && rf.log[idx].Term == args.Entries[i].Term {
+				continue
+			} else {
+				rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+				break
 			}
 		}
-		rf.commitIndex = nextIndex
+	}
+	if args.LeaderCommit > rf.commitIndex && rf.log[len(rf.log)-1].Term == rf.currentTerm {
+		nextIndex := min(args.LeaderCommit, len(rf.log)-1)
+		if nextIndex > rf.lastApplied {
+			for i := rf.commitIndex + 1; i <= nextIndex; i++ {
+				//fmt.Println("follower", rf.me, "apply", rf.log[i].Command, "at", i)
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[i].Command,
+					CommandIndex: i,
+				}
+			}
+			rf.commitIndex = nextIndex
+			rf.lastApplied = nextIndex
+		}
 	}
 
 }
@@ -503,7 +559,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 func (rf *Raft) sendAgreement(i int, index int, term int) {
-	//fmt.Println("leader", rf.me, ", peer", i, ", index", index, ",term", term, ",cmd", entry.Command)
 	args := &AppendEntriesArgs{
 		Term:         term,
 		LeaderId:     rf.me,
@@ -524,43 +579,87 @@ func (rf *Raft) sendAgreement(i int, index int, term int) {
 	if !reply.Success && reply.Term > rf.currentTerm {
 		rf.state = Follower
 		rf.currentTerm = reply.Term
-		rf.votedFor = nil
+		rf.votedFor = -1
+		return
+	}
+
+	if reply.Term != term {
 		return
 	}
 
 	if reply.Success {
-		rf.nextIndex[i] = index + len(args.Entries)
-		rf.matchIndex[i] = index + len(args.Entries) - 1
-	} else {
-		rf.nextIndex[i] = index - 1
+		rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[i] = rf.matchIndex[i] + 1
+		//fmt.Println(rf.me, rf.nextIndex, rf.state)
+		idx := findNextCommitIndex(rf.matchIndex, rf.commitIndex, rf.me)
+		if rf.log[idx].Term != rf.currentTerm {
+			return
+		}
+		//fmt.Println("current commit", rf.commitIndex, "next commit", idx)
+		if idx > rf.lastApplied {
+			for i := rf.commitIndex + 1; i <= idx; i++ {
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[i].Command,
+					CommandIndex: i,
+				}
+				//fmt.Println("leader", rf.me, "apply", i, rf.log[i].Command)
+			}
+			rf.commitIndex = idx
+			rf.lastApplied = idx
+		}
+	} else if reply.XLen > 0 {
+		if reply.XLen < index {
+			rf.nextIndex[i] = reply.XLen
+		} else {
+			idx := findLastIndexOfTerm(rf.log, reply.XTerm)
+			if idx != -1 {
+				rf.nextIndex[i] = idx
+			} else {
+				rf.nextIndex[i] = reply.XIndex
+			}
+		}
 	}
+}
+
+func findNextCommitIndex(matchIndex []int, commitIndex int, me int) int {
+	mx := 0
+	for _, i := range matchIndex {
+		mx = max(mx, i)
+	}
+	l, r := commitIndex, mx
+	cntNeed := len(matchIndex)/2 + 1
+	for l < r {
+		mid := (l + r + 1) >> 1
+		cnt := 1
+		for i, x := range matchIndex {
+			if i == me {
+				continue
+			}
+			if x >= mid {
+				cnt++
+			}
+		}
+		if cnt >= cntNeed {
+			l = mid
+		} else {
+			r = mid - 1
+		}
+	}
+	return l
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (rf *Raft) checkCommitIndex() {
 	for {
 		if rf.state != Leader {
 			break
-		}
-		cnt := 1
-		need := (len(rf.peers) / 2) + 1
-		nextIndex := rf.commitIndex + 1
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			if rf.matchIndex[i] >= nextIndex {
-				cnt++
-			}
-		}
-		if cnt >= need {
-			// persist and looking for next commit
-			//fmt.Println(rf.me, "commit", index)
-			rf.commitIndex = nextIndex
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log[nextIndex].Command,
-				CommandIndex: nextIndex,
-			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
